@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openenv-incident-response-env"
+version = "0.1.0"
+description = "Incident Response / On-Call Triage environment for OpenEnv — train AI agents to diagnose and fix production infrastructure incidents"
+requires-python = ">=3.10"
+dependencies = [
+    "openenv-core[core]>=0.2.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.0.0",
+]
+baseline = [
+    "openai>=1.0.0",
+]
+
+[project.scripts]
+server = "incident_response_env.server.app:main"
+
+[tool.setuptools]
+include-package-data = true
+packages = ["incident_response_env", "incident_response_env.server"]
+package-dir = { "incident_response_env" = ".", "incident_response_env.server" = "server" }
