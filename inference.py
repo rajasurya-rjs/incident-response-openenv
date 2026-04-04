@@ -3,16 +3,17 @@
 Uses the OpenAI-compatible client to run an LLM agent against all 4 tasks
 and produce reproducible baseline scores.
 
-Required environment variables:
+MANDATORY environment variables:
     API_BASE_URL   The API endpoint for the LLM
     MODEL_NAME     The model identifier to use for inference
     HF_TOKEN       Your Hugging Face / API key
 
-Usage:
-    # Start the environment server first:
-    uvicorn incident_response_env.server.app:app --port 8000
+STDOUT FORMAT:
+    [START] task=<task_name> env=incident_response model=<model_name>
+    [STEP]  step=<n> action=<action_str> reward=<0.00> done=<true|false> error=<msg|null>
+    [END]   success=<true|false> steps=<n> rewards=<r1,r2,...,rn>
 
-    # Then run inference:
+Usage:
     API_BASE_URL=https://router.huggingface.co/v1 \
     MODEL_NAME=meta-llama/Llama-3.1-8B-Instruct \
     HF_TOKEN=hf_... \
@@ -42,7 +43,8 @@ MODEL_NAME = os.getenv("MODEL_NAME", "")
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-MAX_STEPS = 25  # Hard cap per episode to stay within 20min total runtime
+BENCHMARK = "incident_response"
+MAX_STEPS = 25
 TEMPERATURE = 0.0
 MAX_TOKENS = 300
 
@@ -133,67 +135,83 @@ def parse_action(response_text: str) -> IncidentResponseAction:
     return IncidentResponseAction(command="escalate")
 
 
-def run_task(client: OpenAI, env_url: str, task_id: str, verbose: bool = True) -> float:
+def run_task(client: OpenAI, env_url: str, task_id: str) -> float:
     """Run a single task and return the score."""
-    with IncidentResponseEnv(base_url=env_url).sync() as env:
-        result = env.reset(task_id=task_id)
+    step = 0
+    step_rewards = []
+    score = 0.0
 
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    f"ALERT:\n{result.observation.alert_summary}\n\n"
-                    f"Available services: {', '.join(result.observation.available_services)}\n"
-                    f"Available commands: {', '.join(result.observation.available_commands)}\n\n"
-                    f"Begin your investigation."
-                ),
-            },
-        ]
+    # [START] — always emitted at episode begin
+    print(f"[START] task={task_id} env={BENCHMARK} model={MODEL_NAME}")
 
-        step = 0
-        while not result.done and step < MAX_STEPS:
-            step += 1
+    try:
+        with IncidentResponseEnv(base_url=env_url).sync() as env:
+            result = env.reset(task_id=task_id)
 
-            try:
-                response = client.chat.completions.create(
-                    model=MODEL_NAME,
-                    messages=messages,
-                    temperature=TEMPERATURE,
-                    max_tokens=MAX_TOKENS,
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        f"ALERT:\n{result.observation.alert_summary}\n\n"
+                        f"Available services: {', '.join(result.observation.available_services)}\n"
+                        f"Available commands: {', '.join(result.observation.available_commands)}\n\n"
+                        f"Begin your investigation."
+                    ),
+                },
+            ]
+
+            while not result.done and step < MAX_STEPS:
+                step += 1
+
+                try:
+                    response = client.chat.completions.create(
+                        model=MODEL_NAME,
+                        messages=messages,
+                        temperature=TEMPERATURE,
+                        max_tokens=MAX_TOKENS,
+                    )
+                    assistant_msg = response.choices[0].message.content or ""
+                except Exception as exc:
+                    assistant_msg = '{"command": "escalate", "target": "", "parameters": {}}'
+
+                messages.append({"role": "assistant", "content": assistant_msg})
+
+                action = parse_action(assistant_msg)
+                action_str = f"{action.command}({action.target})" if action.target else f"{action.command}()"
+
+                result = env.step(action)
+
+                reward = result.reward if result.reward is not None else 0.0
+                step_rewards.append(reward)
+                done_str = "true" if result.done else "false"
+
+                # [STEP] — emitted immediately after env.step()
+                print(f"[STEP] step={step} action={action_str} reward={reward:.2f} done={done_str} error=null")
+
+                # Feed observation back to the LLM
+                feedback = (
+                    f"Command output:\n{result.observation.command_output}\n\n"
+                    f"Reward: {result.reward} | "
+                    f"Services investigated: {result.observation.services_investigated} | "
+                    f"Time elapsed: {result.observation.time_elapsed_minutes}min"
                 )
-                assistant_msg = response.choices[0].message.content or ""
-            except Exception as exc:
-                print(f"  LLM request failed ({exc}). Using escalate fallback.")
-                assistant_msg = '{"command": "escalate", "target": "", "parameters": {}}'
+                if result.done:
+                    feedback += "\n\nEpisode complete."
+                messages.append({"role": "user", "content": feedback})
 
-            messages.append({"role": "assistant", "content": assistant_msg})
+            score = result.reward if result.reward is not None else 0.0
 
-            action = parse_action(assistant_msg)
+    except Exception as e:
+        # Ensure [END] is emitted even on exception
+        print(f"[STEP] step={step + 1} action=error() reward=0.00 done=true error={e}", flush=True)
+        step_rewards.append(0.0)
+        step += 1
 
-            if verbose:
-                print(f"  Step {step}: {action.command} {action.target}")
-
-            result = env.step(action)
-
-            # Feed observation back to the LLM
-            feedback = (
-                f"Command output:\n{result.observation.command_output}\n\n"
-                f"Reward: {result.reward} | "
-                f"Services investigated: {result.observation.services_investigated} | "
-                f"Time elapsed: {result.observation.time_elapsed_minutes}min"
-            )
-
-            if result.done:
-                feedback += "\n\nEpisode complete."
-
-            messages.append({"role": "user", "content": feedback})
-
-        score = result.reward if result.reward is not None else 0.0
-        state = env.state()
-
-        if verbose:
-            print(f"  Result: score={score:.4f}, steps={state.step_count}")
+    # [END] — always emitted, even on exception
+    rewards_str = ",".join(f"{r:.2f}" for r in step_rewards) if step_rewards else "0.00"
+    success_str = "true" if score > 0.5 else "false"
+    print(f"[END] success={success_str} steps={step} rewards={rewards_str}")
 
     return score
 
@@ -209,43 +227,20 @@ def main() -> None:
         print("ERROR: HF_TOKEN environment variable is required.")
         sys.exit(1)
 
-    # Create OpenAI-compatible client with required env vars
     client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
-
     env_url = os.getenv("ENV_URL", "http://localhost:8000")
-    verbose = os.getenv("QUIET", "").lower() not in ("1", "true", "yes")
-
-    print("Incident Response Environment — Inference")
-    print(f"  Model:       {MODEL_NAME}")
-    print(f"  API URL:     {API_BASE_URL}")
-    print(f"  Environment: {env_url}")
-    print(f"  Tasks:       {TASK_IDS}")
-    print("=" * 60)
 
     scores = {}
     for task_id in TASK_IDS:
-        print(f"\n--- Task: {task_id} ---")
         try:
-            score = run_task(client, env_url, task_id, verbose=verbose)
+            score = run_task(client, env_url, task_id)
             scores[task_id] = score
         except Exception as e:
-            print(f"  ERROR: {e}")
+            print(f"[END] success=false steps=0 rewards=0.00")
             scores[task_id] = 0.0
 
-    print("\n" + "=" * 60)
-    print("INFERENCE RESULTS")
-    print("=" * 60)
-    for task_id, score in scores.items():
-        difficulty = {
-            "disk_full": "easy",
-            "bad_deploy": "medium",
-            "memory_and_cache": "hard",
-            "kafka_lag": "medium-hard",
-        }.get(task_id, "unknown")
-        print(f"  {task_id:25s} ({difficulty:12s}): {score:.4f}")
-
     avg = sum(scores.values()) / len(scores) if scores else 0.0
-    print(f"\n  {'Average':25s}              : {avg:.4f}")
+    print(f"\nAverage score: {avg:.4f}")
 
 
 if __name__ == "__main__":
