@@ -207,7 +207,8 @@ def run_task(client: OpenAI, env_url: str, task_id: str) -> float:
 
     except Exception as e:
         # Ensure [END] is emitted even on exception
-        print(f"[STEP] step={step + 1} action=error() reward=0.00 done=true error={e}", flush=True)
+        error_msg = str(e).replace('\n', ' ').replace('\r', '')
+        print(f"[STEP] step={step + 1} action=error() reward=0.00 done=true error={error_msg}", flush=True)
         step_rewards.append(0.0)
         step += 1
 

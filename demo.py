@@ -14,10 +14,12 @@ Usage:
 import os
 import sys
 
-# Allow running from inside the incident_response_env directory
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-
-from incident_response_env import IncidentResponseEnv, IncidentResponseAction
+# Support both package and flat repo structure
+try:
+    from incident_response_env import IncidentResponseEnv, IncidentResponseAction
+except ModuleNotFoundError:
+    from client import IncidentResponseEnv
+    from models import IncidentResponseAction
 
 
 def main():
