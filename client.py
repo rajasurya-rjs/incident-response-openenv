@@ -5,11 +5,18 @@ from typing import Dict
 from openenv.core import EnvClient
 from openenv.core.client_types import StepResult
 
-from .models import (
-    IncidentResponseAction,
-    IncidentResponseObservation,
-    IncidentResponseState,
-)
+try:
+    from .models import (
+        IncidentResponseAction,
+        IncidentResponseObservation,
+        IncidentResponseState,
+    )
+except ImportError:
+    from models import (
+        IncidentResponseAction,
+        IncidentResponseObservation,
+        IncidentResponseState,
+    )
 
 
 class IncidentResponseEnv(

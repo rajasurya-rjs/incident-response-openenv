@@ -27,11 +27,14 @@ import sys
 
 from openai import OpenAI
 
-# Ensure imports work from project root
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from incident_response_env import IncidentResponseEnv, IncidentResponseAction
-from incident_response_env.scenarios import TASK_IDS
+# Import from flat repo structure (all .py files at root level)
+try:
+    from incident_response_env import IncidentResponseEnv, IncidentResponseAction
+    from incident_response_env.scenarios import TASK_IDS
+except ModuleNotFoundError:
+    from client import IncidentResponseEnv
+    from models import IncidentResponseAction
+    from scenarios import TASK_IDS
 
 # ---------------------------------------------------------------------------
 # Required environment variables
