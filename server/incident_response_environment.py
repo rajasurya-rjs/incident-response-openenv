@@ -119,7 +119,7 @@ class IncidentResponseEnvironment(Environment):
 
         return IncidentResponseObservation(
             done=False,
-            reward=None,
+            reward=0.01,
             alert_summary=self._scenario.alert_text,
             command_output="Incident channel opened. You are the on-call engineer. Investigate and resolve this incident.",
             available_commands=list(ALL_COMMANDS),
@@ -355,12 +355,13 @@ class IncidentResponseEnvironment(Environment):
         self, command_output: str, reward: float = 0.0
     ) -> IncidentResponseObservation:
         """Create a non-terminal observation."""
-        self._cumulative_reward += reward
+        safe_r = max(0.01, min(0.99, reward)) if reward is not None else 0.01
+        self._cumulative_reward += safe_r
         time_elapsed = self._state.step_count * 2  # ~2 min per step
 
         return IncidentResponseObservation(
             done=False,
-            reward=round(reward, 4),
+            reward=round(safe_r, 4),
             alert_summary=self._scenario.alert_text,
             command_output=command_output,
             available_commands=list(ALL_COMMANDS),
