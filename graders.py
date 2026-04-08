@@ -142,4 +142,6 @@ def compute_final_score(
     rem = score_remediation(remediations_taken, scenario)
     eff = score_efficiency(actual_steps, scenario)
 
-    return round(0.30 * inv + 0.25 * diag + 0.30 * rem + 0.15 * eff, 4)
+    raw = 0.30 * inv + 0.25 * diag + 0.30 * rem + 0.15 * eff
+    # Evaluator requires strictly open interval (0, 1) — clamp away from boundaries
+    return round(max(0.0001, min(0.9999, raw)), 4)
