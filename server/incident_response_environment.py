@@ -375,7 +375,7 @@ class IncidentResponseEnvironment(Environment):
         """Create a terminal observation (episode over, no score computation)."""
         return IncidentResponseObservation(
             done=True,
-            reward=0.0,
+            reward=0.01,  # Never 0.0 — evaluator requires strictly open interval (0,1)
             alert_summary=self._scenario.alert_text if self._scenario else "",
             command_output=message,
             available_commands=[],

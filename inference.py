@@ -108,6 +108,17 @@ For the diagnose command, include an explanation:
 """
 
 
+def _safe_reward(r) -> float:
+    """Clamp reward to strictly open (0.01, 0.99) interval.
+
+    Evaluator requires task scores strictly between 0 and 1.
+    Using 0.01/0.99 because f"{0.01:.2f}"="0.01" and f"{0.99:.2f}"="0.99" are safe.
+    """
+    if r is None:
+        return 0.01
+    return max(0.01, min(0.99, float(r)))
+
+
 def _make_action(command="escalate", target="", parameters=None):
     """Create an action object."""
     if IncidentResponseAction is not None:
@@ -257,11 +268,11 @@ def run_task(client, env_url: str, task_id: str) -> float:
                         result = env.step(action)
                     except Exception as step_err:
                         err = str(step_err).replace("\n", " ").replace("\r", "")
-                        print(f"[STEP] step={step} action={action_str} reward=0.00 done=true error={err}", flush=True)
-                        step_rewards.append(0.0)
+                        print(f"[STEP] step={step} action={action_str} reward=0.01 done=true error={err}", flush=True)
+                        step_rewards.append(0.01)
                         break
 
-                    reward = result.reward if result.reward is not None else 0.0
+                    reward = _safe_reward(result.reward)
                     step_rewards.append(reward)
                     done_str = "true" if result.done else "false"
                     print(f"[STEP] step={step} action={action_str} reward={reward:.2f} done={done_str} error=null", flush=True)
@@ -276,7 +287,7 @@ def run_task(client, env_url: str, task_id: str) -> float:
                         feedback += "\n\nEpisode complete."
                     messages.append({"role": "user", "content": feedback})
 
-                score = result.reward if result.reward is not None else 0.0
+                score = _safe_reward(result.reward)
 
         except Exception as env_err:
             # Connection failed at __enter__ or reset — fall through to LLM-only path
@@ -299,10 +310,10 @@ def run_task(client, env_url: str, task_id: str) -> float:
             step_rewards.append(0.01)
         except Exception as e:
             err = str(e).replace("\n", " ").replace("\r", "")
-            print(f"[STEP] step={step} action=error() reward=0.00 done=true error={err}", flush=True)
-            step_rewards.append(0.0)
+            print(f"[STEP] step={step} action=error() reward=0.01 done=true error={err}", flush=True)
+            step_rewards.append(0.01)
 
-    rewards_str = ",".join(f"{r:.2f}" for r in step_rewards) if step_rewards else "0.00"
+    rewards_str = ",".join(f"{r:.2f}" for r in step_rewards) if step_rewards else "0.01"
     success_str = "true" if score > 0.5 else "false"
     print(f"[END] success={success_str} steps={step} rewards={rewards_str}", flush=True)
 
