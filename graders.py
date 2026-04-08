@@ -143,5 +143,7 @@ def compute_final_score(
     eff = score_efficiency(actual_steps, scenario)
 
     raw = 0.30 * inv + 0.25 * diag + 0.30 * rem + 0.15 * eff
-    # Evaluator requires strictly open interval (0, 1) — clamp away from boundaries
-    return round(max(0.0001, min(0.9999, raw)), 4)
+    # Evaluator requires strictly open interval (0, 1).
+    # Use 0.01/0.99 — these format as "0.01"/"0.99" with :.2f, safely within range.
+    # (0.0001/0.9999 would round to "0.00"/"1.00" with :.2f and still fail.)
+    return round(max(0.01, min(0.99, raw)), 4)

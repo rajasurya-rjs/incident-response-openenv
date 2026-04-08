@@ -295,8 +295,8 @@ def run_task(client, env_url: str, task_id: str) -> float:
             action_str = f"{action.command}({action.target})" if action.target else f"{action.command}()"
 
             err = str(connect_err).replace("\n", " ").replace("\r", "") if connect_err else "env_unavailable"
-            print(f"[STEP] step={step} action={action_str} reward=0.00 done=true error={err}", flush=True)
-            step_rewards.append(0.0)
+            print(f"[STEP] step={step} action={action_str} reward=0.01 done=true error={err}", flush=True)
+            step_rewards.append(0.01)
         except Exception as e:
             err = str(e).replace("\n", " ").replace("\r", "")
             print(f"[STEP] step={step} action=error() reward=0.00 done=true error={err}", flush=True)
