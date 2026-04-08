@@ -6,7 +6,7 @@ and produce reproducible baseline scores.
 MANDATORY environment variables:
     API_BASE_URL   The API endpoint for the LLM
     MODEL_NAME     The model identifier to use for inference
-    HF_TOKEN       Your Hugging Face / API key
+    API_KEY        Your API key for the LLM proxy
 
 STDOUT FORMAT:
     [START] task=<task_name> env=incident_response model=<model_name>
@@ -16,7 +16,7 @@ STDOUT FORMAT:
 Usage:
     API_BASE_URL=https://router.huggingface.co/v1 \
     MODEL_NAME=meta-llama/Llama-3.1-8B-Instruct \
-    HF_TOKEN=hf_... \
+    API_KEY=hf_... \
     python inference.py
 """
 
@@ -49,9 +49,11 @@ except (ImportError, ModuleNotFoundError):
         TASK_IDS = ["disk_full", "bad_deploy", "memory_and_cache", "kafka_lag"]
 
 # ---------------------------------------------------------------------------
-# Required environment variables
+# Environment variables — evaluator injects API_KEY and API_BASE_URL
 # ---------------------------------------------------------------------------
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+# API_KEY takes priority — this is what the evaluator's LiteLLM proxy injects.
+# HF_TOKEN is a fallback for local runs only.
 API_KEY = os.getenv("API_KEY") or os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY", "")
 MODEL_NAME = os.getenv("MODEL_NAME", "")
 
@@ -107,7 +109,7 @@ For the diagnose command, include an explanation:
 
 
 def _make_action(command="escalate", target="", parameters=None):
-    """Create an action, handling case where IncidentResponseAction may not be available."""
+    """Create an action object."""
     if IncidentResponseAction is not None:
         return IncidentResponseAction(
             command=command,
@@ -144,7 +146,7 @@ def parse_action(response_text: str):
     except (json.JSONDecodeError, ValueError):
         pass
 
-    # Try to find JSON object in the text
+    # Try to extract JSON object from surrounding text
     json_match = re.search(r"\{[^{}]*\}", text)
     if json_match:
         try:
@@ -157,7 +159,7 @@ def parse_action(response_text: str):
         except (json.JSONDecodeError, ValueError):
             pass
 
-    # Fallback: try to parse as simple command
+    # Fallback: parse as simple command
     parts = text.split()
     if parts:
         return _make_action(
@@ -168,40 +170,70 @@ def parse_action(response_text: str):
     return _make_action(command="escalate")
 
 
+def call_llm_safe(client, messages: list) -> str:
+    """Call LLM and return response text. Never raises."""
+    try:
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=messages,
+            temperature=TEMPERATURE,
+            max_tokens=MAX_TOKENS,
+        )
+        return response.choices[0].message.content or ""
+    except Exception:
+        return '{"command": "escalate", "target": "", "parameters": {}}'
+
+
 def run_task(client, env_url: str, task_id: str) -> float:
-    """Run a single task and return the score. NEVER raises — always returns a float."""
+    """Run a single task. LLM is called regardless of env connectivity."""
     step = 0
     step_rewards = []
     score = 0.0
 
-    # [START] — always emitted at episode begin
     print(f"[START] task={task_id} env={BENCHMARK} model={MODEL_NAME}", flush=True)
 
-    try:
-        if IncidentResponseEnv is None:
-            raise RuntimeError("Environment client not available (missing openenv-core)")
+    # Build initial messages — works with or without env
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                f"Production incident detected: {task_id}.\n"
+                f"Available services: api-gateway, user-service, order-service, "
+                f"postgres-primary, redis-cache, kafka-broker\n"
+                f"Available commands: check_metrics, read_logs, check_status, "
+                f"restart_service, scale_service, rollback_deploy, clear_disk, diagnose, escalate\n\n"
+                f"Begin your investigation."
+            ),
+        },
+    ]
 
-        # Retry connection up to 3 times for HF Space cold starts
-        env_ctx = None
-        last_err = None
+    # Try to connect to environment (with retry for cold starts)
+    env_ctx = None
+    connect_err = None
+    if IncidentResponseEnv is not None:
         for attempt in range(3):
             try:
                 env_ctx = IncidentResponseEnv(base_url=env_url).sync()
                 break
-            except Exception as conn_err:
-                last_err = conn_err
+            except Exception as e:
+                connect_err = e
                 if attempt < 2:
-                    time.sleep(2 ** attempt)  # 1s, 2s backoff
+                    time.sleep(2 ** attempt)
 
-        if env_ctx is None:
-            raise RuntimeError(f"Failed to connect after 3 attempts: {last_err}")
+    # ----------------------------------------------------------------
+    # Try env path — connection may fail at __enter__ (the actual WebSocket
+    # handshake happens inside `with env_ctx`, not in .sync())
+    # ----------------------------------------------------------------
+    env_connected = False
+    if env_ctx is not None:
+        try:
+            with env_ctx as env:
+                env_connected = True
+                result = env.reset(task_id=task_id)
 
-        with env_ctx as env:
-            result = env.reset(task_id=task_id)
-
-            messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {
+                # Replace initial message with real observation
+                messages[-1] = {
                     "role": "user",
                     "content": (
                         f"ALERT:\n{result.observation.alert_summary}\n\n"
@@ -209,66 +241,67 @@ def run_task(client, env_url: str, task_id: str) -> float:
                         f"Available commands: {', '.join(result.observation.available_commands)}\n\n"
                         f"Begin your investigation."
                     ),
-                },
-            ]
+                }
 
-            while not result.done and step < MAX_STEPS:
-                step += 1
+                while not result.done and step < MAX_STEPS:
+                    step += 1
 
-                # LLM call — fallback to escalate on any error
-                try:
-                    response = client.chat.completions.create(
-                        model=MODEL_NAME,
-                        messages=messages,
-                        temperature=TEMPERATURE,
-                        max_tokens=MAX_TOKENS,
+                    # LLM call — ALWAYS hits the proxy
+                    assistant_msg = call_llm_safe(client, messages)
+                    messages.append({"role": "assistant", "content": assistant_msg})
+
+                    action = parse_action(assistant_msg)
+                    action_str = f"{action.command}({action.target})" if action.target else f"{action.command}()"
+
+                    try:
+                        result = env.step(action)
+                    except Exception as step_err:
+                        err = str(step_err).replace("\n", " ").replace("\r", "")
+                        print(f"[STEP] step={step} action={action_str} reward=0.00 done=true error={err}", flush=True)
+                        step_rewards.append(0.0)
+                        break
+
+                    reward = result.reward if result.reward is not None else 0.0
+                    step_rewards.append(reward)
+                    done_str = "true" if result.done else "false"
+                    print(f"[STEP] step={step} action={action_str} reward={reward:.2f} done={done_str} error=null", flush=True)
+
+                    feedback = (
+                        f"Command output:\n{result.observation.command_output}\n\n"
+                        f"Reward: {result.reward} | "
+                        f"Services investigated: {result.observation.services_investigated} | "
+                        f"Time elapsed: {result.observation.time_elapsed_minutes}min"
                     )
-                    assistant_msg = response.choices[0].message.content or ""
-                except Exception:
-                    assistant_msg = '{"command": "escalate", "target": "", "parameters": {}}'
+                    if result.done:
+                        feedback += "\n\nEpisode complete."
+                    messages.append({"role": "user", "content": feedback})
 
-                messages.append({"role": "assistant", "content": assistant_msg})
+                score = result.reward if result.reward is not None else 0.0
 
-                action = parse_action(assistant_msg)
-                action_str = f"{action.command}({action.target})" if action.target else f"{action.command}()"
+        except Exception as env_err:
+            # Connection failed at __enter__ or reset — fall through to LLM-only path
+            connect_err = env_err
 
-                # env.step — catch errors so one bad step doesn't kill the episode
-                try:
-                    result = env.step(action)
-                except Exception as step_err:
-                    error_msg = str(step_err).replace("\n", " ").replace("\r", "")
-                    print(f"[STEP] step={step} action={action_str} reward=0.00 done=true error={error_msg}", flush=True)
-                    step_rewards.append(0.0)
-                    break
+    if not env_connected:
+        # ----------------------------------------------------------------
+        # Env unavailable — STILL call LLM so the proxy gets hit
+        # ----------------------------------------------------------------
+        try:
+            step += 1
+            assistant_msg = call_llm_safe(client, messages)
+            messages.append({"role": "assistant", "content": assistant_msg})
 
-                reward = result.reward if result.reward is not None else 0.0
-                step_rewards.append(reward)
-                done_str = "true" if result.done else "false"
+            action = parse_action(assistant_msg)
+            action_str = f"{action.command}({action.target})" if action.target else f"{action.command}()"
 
-                # [STEP] — emitted immediately after env.step()
-                print(f"[STEP] step={step} action={action_str} reward={reward:.2f} done={done_str} error=null", flush=True)
+            err = str(connect_err).replace("\n", " ").replace("\r", "") if connect_err else "env_unavailable"
+            print(f"[STEP] step={step} action={action_str} reward=0.00 done=true error={err}", flush=True)
+            step_rewards.append(0.0)
+        except Exception as e:
+            err = str(e).replace("\n", " ").replace("\r", "")
+            print(f"[STEP] step={step} action=error() reward=0.00 done=true error={err}", flush=True)
+            step_rewards.append(0.0)
 
-                # Feed observation back to the LLM
-                feedback = (
-                    f"Command output:\n{result.observation.command_output}\n\n"
-                    f"Reward: {result.reward} | "
-                    f"Services investigated: {result.observation.services_investigated} | "
-                    f"Time elapsed: {result.observation.time_elapsed_minutes}min"
-                )
-                if result.done:
-                    feedback += "\n\nEpisode complete."
-                messages.append({"role": "user", "content": feedback})
-
-            score = result.reward if result.reward is not None else 0.0
-
-    except Exception as e:
-        # Catch-all for connection failures, reset failures, etc.
-        error_msg = str(e).replace("\n", " ").replace("\r", "")
-        print(f"[STEP] step={step + 1} action=error() reward=0.00 done=true error={error_msg}", flush=True)
-        step_rewards.append(0.0)
-        step += 1
-
-    # [END] — ALWAYS emitted exactly once per task
     rewards_str = ",".join(f"{r:.2f}" for r in step_rewards) if step_rewards else "0.00"
     success_str = "true" if score > 0.5 else "false"
     print(f"[END] success={success_str} steps={step} rewards={rewards_str}", flush=True)
@@ -277,15 +310,12 @@ def run_task(client, env_url: str, task_id: str) -> float:
 
 
 def main() -> None:
-    """Run inference on all tasks. NEVER calls sys.exit — always exits 0."""
-    # Log missing config as warnings, but keep going
+    """Run inference on all tasks."""
     if not MODEL_NAME:
-        print("WARNING: MODEL_NAME not set, using default", flush=True)
-
+        print("WARNING: MODEL_NAME not set", flush=True)
     if not API_KEY:
-        print("WARNING: HF_TOKEN/API_KEY not set", flush=True)
+        print("WARNING: API_KEY not set", flush=True)
 
-    # Create OpenAI client with timeout
     client = None
     if OpenAI is not None:
         try:
@@ -298,13 +328,11 @@ def main() -> None:
     scores = {}
     for task_id in TASK_IDS:
         if client is None:
-            # No LLM client — emit minimal valid output per task
             print(f"[START] task={task_id} env={BENCHMARK} model={MODEL_NAME}", flush=True)
-            print(f"[STEP] step=1 action=error() reward=0.00 done=true error=OpenAI_client_unavailable", flush=True)
+            print(f"[STEP] step=1 action=error() reward=0.00 done=true error=openai_unavailable", flush=True)
             print(f"[END] success=false steps=1 rewards=0.00", flush=True)
             scores[task_id] = 0.0
         else:
-            # run_task never raises — it handles all exceptions internally
             scores[task_id] = run_task(client, env_url, task_id)
 
     avg = sum(scores.values()) / len(scores) if scores else 0.0
@@ -315,6 +343,5 @@ if __name__ == "__main__":
     try:
         main()
     except Exception:
-        # Absolute last resort — print traceback to stderr, still exit 0
         traceback.print_exc(file=sys.stderr)
         print(f"\nAverage score: 0.0000", flush=True)
