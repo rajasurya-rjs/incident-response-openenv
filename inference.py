@@ -199,7 +199,7 @@ def run_task(client, env_url: str, task_id: str) -> float:
     """Run a single task. LLM is called regardless of env connectivity."""
     step = 0
     step_rewards = []
-    score = 0.0
+    score = 0.01
 
     print(f"[START] task={task_id} env={BENCHMARK} model={MODEL_NAME}", flush=True)
 
@@ -308,14 +308,16 @@ def run_task(client, env_url: str, task_id: str) -> float:
             err = str(connect_err).replace("\n", " ").replace("\r", "") if connect_err else "env_unavailable"
             print(f"[STEP] step={step} action={action_str} reward=0.01 done=true error={err}", flush=True)
             step_rewards.append(0.01)
+            score = 0.01
         except Exception as e:
             err = str(e).replace("\n", " ").replace("\r", "")
             print(f"[STEP] step={step} action=error() reward=0.01 done=true error={err}", flush=True)
             step_rewards.append(0.01)
+            score = 0.01
 
     rewards_str = ",".join(f"{r:.2f}" for r in step_rewards) if step_rewards else "0.01"
     success_str = "true" if score > 0.5 else "false"
-    print(f"[END] success={success_str} steps={step} rewards={rewards_str}", flush=True)
+    print(f"[END] task={task_id} success={success_str} steps={step} score={score:.3f} rewards={rewards_str}", flush=True)
 
     return score
 
@@ -340,9 +342,9 @@ def main() -> None:
     for task_id in TASK_IDS:
         if client is None:
             print(f"[START] task={task_id} env={BENCHMARK} model={MODEL_NAME}", flush=True)
-            print(f"[STEP] step=1 action=error() reward=0.00 done=true error=openai_unavailable", flush=True)
-            print(f"[END] success=false steps=1 rewards=0.00", flush=True)
-            scores[task_id] = 0.0
+            print(f"[STEP] step=1 action=error() reward=0.01 done=true error=openai_unavailable", flush=True)
+            print(f"[END] task={task_id} success=false steps=1 score=0.010 rewards=0.01", flush=True)
+            scores[task_id] = 0.01
         else:
             scores[task_id] = run_task(client, env_url, task_id)
 
