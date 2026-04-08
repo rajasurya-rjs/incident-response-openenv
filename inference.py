@@ -24,17 +24,29 @@ import json
 import os
 import re
 import sys
+import time
+import traceback
 
-from openai import OpenAI
+# ---------------------------------------------------------------------------
+# Robust imports — NEVER crash on missing packages
+# ---------------------------------------------------------------------------
+try:
+    from openai import OpenAI
+except (ImportError, ModuleNotFoundError):
+    OpenAI = None
 
-# Import from flat repo structure (all .py files at root level)
 try:
     from incident_response_env import IncidentResponseEnv, IncidentResponseAction
     from incident_response_env.scenarios import TASK_IDS
-except ModuleNotFoundError:
-    from client import IncidentResponseEnv
-    from models import IncidentResponseAction
-    from scenarios import TASK_IDS
+except (ImportError, ModuleNotFoundError):
+    try:
+        from client import IncidentResponseEnv
+        from models import IncidentResponseAction
+        from scenarios import TASK_IDS
+    except (ImportError, ModuleNotFoundError):
+        IncidentResponseEnv = None
+        IncidentResponseAction = None
+        TASK_IDS = ["disk_full", "bad_deploy", "memory_and_cache", "kafka_lag"]
 
 # ---------------------------------------------------------------------------
 # Required environment variables
@@ -94,8 +106,26 @@ For the diagnose command, include an explanation:
 """
 
 
-def parse_action(response_text: str) -> IncidentResponseAction:
-    """Parse LLM response into an IncidentResponseAction."""
+def _make_action(command="escalate", target="", parameters=None):
+    """Create an action, handling case where IncidentResponseAction may not be available."""
+    if IncidentResponseAction is not None:
+        return IncidentResponseAction(
+            command=command,
+            target=target,
+            parameters=parameters or {},
+        )
+
+    class _Action:
+        def __init__(self, cmd, tgt, params):
+            self.command = cmd
+            self.target = tgt
+            self.parameters = params
+
+    return _Action(command, target, parameters or {})
+
+
+def parse_action(response_text: str):
+    """Parse LLM response into an action."""
     text = response_text.strip()
 
     # Handle markdown code blocks
@@ -106,7 +136,7 @@ def parse_action(response_text: str) -> IncidentResponseAction:
     # Try direct JSON parse
     try:
         data = json.loads(text)
-        return IncidentResponseAction(
+        return _make_action(
             command=data.get("command", ""),
             target=data.get("target", ""),
             parameters=data.get("parameters", {}),
@@ -119,7 +149,7 @@ def parse_action(response_text: str) -> IncidentResponseAction:
     if json_match:
         try:
             data = json.loads(json_match.group())
-            return IncidentResponseAction(
+            return _make_action(
                 command=data.get("command", ""),
                 target=data.get("target", ""),
                 parameters=data.get("parameters", {}),
@@ -130,25 +160,43 @@ def parse_action(response_text: str) -> IncidentResponseAction:
     # Fallback: try to parse as simple command
     parts = text.split()
     if parts:
-        return IncidentResponseAction(
+        return _make_action(
             command=parts[0],
             target=parts[1] if len(parts) > 1 else "",
         )
 
-    return IncidentResponseAction(command="escalate")
+    return _make_action(command="escalate")
 
 
-def run_task(client: OpenAI, env_url: str, task_id: str) -> float:
-    """Run a single task and return the score."""
+def run_task(client, env_url: str, task_id: str) -> float:
+    """Run a single task and return the score. NEVER raises — always returns a float."""
     step = 0
     step_rewards = []
     score = 0.0
 
     # [START] — always emitted at episode begin
-    print(f"[START] task={task_id} env={BENCHMARK} model={MODEL_NAME}")
+    print(f"[START] task={task_id} env={BENCHMARK} model={MODEL_NAME}", flush=True)
 
     try:
-        with IncidentResponseEnv(base_url=env_url).sync() as env:
+        if IncidentResponseEnv is None:
+            raise RuntimeError("Environment client not available (missing openenv-core)")
+
+        # Retry connection up to 3 times for HF Space cold starts
+        env_ctx = None
+        last_err = None
+        for attempt in range(3):
+            try:
+                env_ctx = IncidentResponseEnv(base_url=env_url).sync()
+                break
+            except Exception as conn_err:
+                last_err = conn_err
+                if attempt < 2:
+                    time.sleep(2 ** attempt)  # 1s, 2s backoff
+
+        if env_ctx is None:
+            raise RuntimeError(f"Failed to connect after 3 attempts: {last_err}")
+
+        with env_ctx as env:
             result = env.reset(task_id=task_id)
 
             messages = [
@@ -167,6 +215,7 @@ def run_task(client: OpenAI, env_url: str, task_id: str) -> float:
             while not result.done and step < MAX_STEPS:
                 step += 1
 
+                # LLM call — fallback to escalate on any error
                 try:
                     response = client.chat.completions.create(
                         model=MODEL_NAME,
@@ -175,7 +224,7 @@ def run_task(client: OpenAI, env_url: str, task_id: str) -> float:
                         max_tokens=MAX_TOKENS,
                     )
                     assistant_msg = response.choices[0].message.content or ""
-                except Exception as exc:
+                except Exception:
                     assistant_msg = '{"command": "escalate", "target": "", "parameters": {}}'
 
                 messages.append({"role": "assistant", "content": assistant_msg})
@@ -183,14 +232,21 @@ def run_task(client: OpenAI, env_url: str, task_id: str) -> float:
                 action = parse_action(assistant_msg)
                 action_str = f"{action.command}({action.target})" if action.target else f"{action.command}()"
 
-                result = env.step(action)
+                # env.step — catch errors so one bad step doesn't kill the episode
+                try:
+                    result = env.step(action)
+                except Exception as step_err:
+                    error_msg = str(step_err).replace("\n", " ").replace("\r", "")
+                    print(f"[STEP] step={step} action={action_str} reward=0.00 done=true error={error_msg}", flush=True)
+                    step_rewards.append(0.0)
+                    break
 
                 reward = result.reward if result.reward is not None else 0.0
                 step_rewards.append(reward)
                 done_str = "true" if result.done else "false"
 
                 # [STEP] — emitted immediately after env.step()
-                print(f"[STEP] step={step} action={action_str} reward={reward:.2f} done={done_str} error=null")
+                print(f"[STEP] step={step} action={action_str} reward={reward:.2f} done={done_str} error=null", flush=True)
 
                 # Feed observation back to the LLM
                 feedback = (
@@ -206,46 +262,59 @@ def run_task(client: OpenAI, env_url: str, task_id: str) -> float:
             score = result.reward if result.reward is not None else 0.0
 
     except Exception as e:
-        # Ensure [END] is emitted even on exception
-        error_msg = str(e).replace('\n', ' ').replace('\r', '')
+        # Catch-all for connection failures, reset failures, etc.
+        error_msg = str(e).replace("\n", " ").replace("\r", "")
         print(f"[STEP] step={step + 1} action=error() reward=0.00 done=true error={error_msg}", flush=True)
         step_rewards.append(0.0)
         step += 1
 
-    # [END] — always emitted, even on exception
+    # [END] — ALWAYS emitted exactly once per task
     rewards_str = ",".join(f"{r:.2f}" for r in step_rewards) if step_rewards else "0.00"
     success_str = "true" if score > 0.5 else "false"
-    print(f"[END] success={success_str} steps={step} rewards={rewards_str}")
+    print(f"[END] success={success_str} steps={step} rewards={rewards_str}", flush=True)
 
     return score
 
 
 def main() -> None:
-    """Run inference on all tasks."""
+    """Run inference on all tasks. NEVER calls sys.exit — always exits 0."""
+    # Log missing config as warnings, but keep going
     if not MODEL_NAME:
-        print("ERROR: MODEL_NAME environment variable is required.")
-        print("Usage: MODEL_NAME=meta-llama/... HF_TOKEN=hf_... python inference.py")
-        sys.exit(1)
+        print("WARNING: MODEL_NAME not set, using default", flush=True)
 
     if not API_KEY:
-        print("ERROR: HF_TOKEN environment variable is required.")
-        sys.exit(1)
+        print("WARNING: HF_TOKEN/API_KEY not set", flush=True)
 
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    # Create OpenAI client with timeout
+    client = None
+    if OpenAI is not None:
+        try:
+            client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY, timeout=60.0)
+        except Exception as e:
+            print(f"WARNING: Failed to create OpenAI client: {e}", flush=True)
+
     env_url = os.getenv("ENV_URL", "http://localhost:8000")
 
     scores = {}
     for task_id in TASK_IDS:
-        try:
-            score = run_task(client, env_url, task_id)
-            scores[task_id] = score
-        except Exception as e:
-            print(f"[END] success=false steps=0 rewards=0.00")
+        if client is None:
+            # No LLM client — emit minimal valid output per task
+            print(f"[START] task={task_id} env={BENCHMARK} model={MODEL_NAME}", flush=True)
+            print(f"[STEP] step=1 action=error() reward=0.00 done=true error=OpenAI_client_unavailable", flush=True)
+            print(f"[END] success=false steps=1 rewards=0.00", flush=True)
             scores[task_id] = 0.0
+        else:
+            # run_task never raises — it handles all exceptions internally
+            scores[task_id] = run_task(client, env_url, task_id)
 
     avg = sum(scores.values()) / len(scores) if scores else 0.0
-    print(f"\nAverage score: {avg:.4f}")
+    print(f"\nAverage score: {avg:.4f}", flush=True)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        # Absolute last resort — print traceback to stderr, still exit 0
+        traceback.print_exc(file=sys.stderr)
+        print(f"\nAverage score: 0.0000", flush=True)
